@@ -42,7 +42,11 @@ def process_image(image_input_path, image_output_path, model, device):
     with torch.no_grad():
         image_input = Image.open(image_input_path).convert('RGB')
         image_input = transforms.ToTensor()(image_input).unsqueeze(0).to(device)
+        # ToTensor: uint8 [H, W, C] (0,255) -> float32 [C, H, W] (0.0, 1.0)
+        # unsqueeze(0): [C, H, W] -> [B, C, H, W]
         image_output = model(image_input).clamp(0.0, 1.0)[0].cpu()
+        # model(image_input): [B, C, sH, sW]
+        # clamp: -> (0, 1)
         image_output = transforms.ToPILImage()(image_output)
         image_output.save(image_output_path)
 

@@ -148,8 +148,13 @@ class dwconv(nn.Module):
 
     def forward(self, x, x_size):
         x = x.transpose(1, 2).view(x.shape[0], self.hidden_features, x_size[0], x_size[1]).contiguous()  # b Ph*Pw c
+        # x [B, N, C] batch B * token N * channel C, N = Ph*Pw
+        # .transpose(1, 2): [B, N, C] -> [B, C, N]
+        # .view: [B, C, N] -> [B, C, Ph, Pw]
         x = self.depthwise_conv(x)
+        # H_out = [(H_in + 2*padding - dilation*(kernel_size-1)-1)/stride + 1]
         x = x.flatten(2).transpose(1, 2).contiguous()
+        # .flatten(2): [B, C, Ph, Pw] -> [B, C, N]; .transpose() -> [B, N, C]
         return x
 
 class ConvFFN(nn.Module):
@@ -222,7 +227,7 @@ class WindowAttention(nn.Module):
         self.qkv_bias = qkv_bias
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
-        self.eps = 1e-20
+        self.eps = 1e-20  # stabilize value for PFA normalization
 
         # define a parameter table of relative position bias
         if dim > 100:
@@ -250,14 +255,19 @@ class WindowAttention(nn.Module):
         b_, n, c4 = qkvp.shape
         c = c4 // 4
         qkvp = qkvp.reshape(b_, n, 4, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
+        # .reshape: [b_, n, c4], n=Wh*Ww, b_=b*num_windows -> [b_, n, 4, heads, c//heads]
+        # .permute: -> [4, b_n, h, n, d]
         q, k, v, v_lepe = qkvp[0], qkvp[1], qkvp[2], qkvp[3]  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
-        # Standard Attention Computation
+        # Standard Attention Computation, q/sqrt(d)
         if pfa_indices[shift] is None:
             attn = (q @ k.transpose(-2, -1))  # b_, self.num_heads, n, n
+            # [b_, h, n, d] @ [b_ h, d, n] -> [b_, h, n, n]
             relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+            # rpi: [n, n], .view(-1) -> n*n; .view: [n*n, h] -> [n, n, h] = [Wh*Ww, Wh*Ww, h]
             relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0)  # nH, Wh*Ww, Wh*Ww
+            # .permute -> [h, n, n]; .unsqueeze -> [1, h, n, n]
             if not self.training:  # Check if in inference mode
                 attn.add_(relative_position_bias)  # only in inference
             else:
@@ -265,19 +275,29 @@ class WindowAttention(nn.Module):
 
             if shift:
                 nw = mask.shape[0]
+                # mask: [num_windows, n, n]
                 attn = attn.view(b_ // nw, nw, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+                # .view -> [b, num_windows, h, n, n]; .unsqueeze(1).unsqueeze(0) -> [1, num_windows, 1, n, n]
                 attn = attn.view(-1, self.num_heads, n, n)
+                # .view -> [b_, h, n, n]
         # # Sparse Attention Computation using SMM_QmK
         else:
             topk = pfa_indices[shift].shape[-1]
+            # pfa_indices[shift]: [b_, h, n, k]
             q = q.contiguous().view(b_ * self.num_heads, n, c // self.num_heads)
+            # .view: [b_, h, n, d] -> [b_*h, n, d]
             k = k.contiguous().view(b_ * self.num_heads, n, c // self.num_heads).transpose(-2, -1)
+            # .transpose -> [b_*h, d, n]
             smm_index = pfa_indices[shift].view(b_ * self.num_heads, n, topk).int()
+            # .view().int() -> [b_*h, n, d]
             attn = SMM_QmK.apply(q, k, smm_index).view(b_, self.num_heads, n, topk)
+            # .view() -> [b_, h, n, k]
 
             relative_position_bias = self.relative_position_bias_table[rpi.view(-1)].view(self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
             relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous().unsqueeze(0).expand(b_, self.num_heads, n, n)  # nH, Wh*Ww, Wh*Ww
+            # .permute().unsqueeze().expand() -> [b_, h, n, n]
             relative_position_bias = torch.gather(relative_position_bias, dim=-1, index=pfa_indices[shift])
+            # .gather() -> [b_, h, n, k]
             if not self.training:  # Check if in inference mode
                 attn.add_(relative_position_bias)  # only in inference
             else:
@@ -330,12 +350,14 @@ class WindowAttention(nn.Module):
         # Check whether sparsification has been applied; if so, use SMM_AmV for computation, otherwise perform standard matrix multiplication A @ V.
         if pfa_indices[shift] is None:
             x = ((attn @ v) + v_lepe).transpose(1, 2).reshape(b_, n, c)
+            # [b_, h, n, n] @ [b_, h, n, d] -> [b_, h, n, d]; .transpose() -> [b_, n, h, d]; .reshape() -> [b_, n, c]
         else:
             topk = pfa_indices[shift].shape[-1]
             attn = attn.view(b_ * self.num_heads, n, topk)
             v = v.contiguous().view(b_ * self.num_heads, n, c // self.num_heads)
             smm_index = pfa_indices[shift].view(b_ * self.num_heads, n, topk).int()
             x = (SMM_AmV.apply(attn, v, smm_index).view(b_, self.num_heads, n, c // self.num_heads)+ v_lepe).transpose(1, 2).reshape(b_, n, c)
+            # SMM_AmV -> [b_*h, n, d]; .view() -> [b_, h, n, d]; .transpose() -> [b_, n, h, d]; .reshape() -> [b_, n, c]
 
         # only in inference. After use, delete unnecessary variables to free memory
         if not self.training:
@@ -351,7 +373,7 @@ class WindowAttention(nn.Module):
     def flops(self, n):
         flops = 0
         if self.layer_id < 2:
-            # attn = (q @ k.transpose(-2, -1))
+            # attn = (q @ k.transpose(-2, -1)) [b_, h, n, d] @ [b_ h, d, n] -> [b_, h, n, n]
             flops += self.num_heads * n * (self.dim // self.num_heads) * n
             #  x = (attn @ v)
             flops += self.num_heads * n * n * (self.dim // self.num_heads)
@@ -442,27 +464,37 @@ class PFTransformerLayer(nn.Module):
         shortcut = x
 
         x = self.norm1(x)
+        # -> [b, n, c]
         x_qkv = self.wqkv(x)
+        # -> [b, n, 3c]
 
         v_lepe = self.v_LePE(torch.split(x_qkv, c, dim=-1)[-1], x_size)
         x_qkvp = torch.cat([x_qkv, v_lepe], dim=-1)
+        # -> [b, n, 4c]
 
         # SW-MSA
         # cyclic shift
         if self.shift_size > 0:
             shift = 1
             shifted_x = torch.roll(x_qkvp.reshape(b, h, w, c4), shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            # .roll() -> [b, Ph, Pw, c4]
         else:
             shift = 0
             shifted_x = x_qkvp.reshape(b, h, w, c4)
+            # .reshape() -> [b, Ph, Pw, c4]
         # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nw*b, window_size, window_size, c
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, c4)  # nw*b, window_size*window_size, c
+        x_windows = window_partition(shifted_x, self.window_size)
+        # [b, Ph, Pw, c4] -> [b*num_windows (b_), Wh, Ww, c4]
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, c4)
+        # -> [b_, n, c4]
         # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
         attn_windows, pfa_values, pfa_indices = self.attn_win(x_windows, pfa_values=pfa_values, pfa_indices=pfa_indices, rpi=params['rpi_sa'], mask=params['attn_mask'], shift=shift)
+        # rpi_sa: [n, n]; attn_mask: [num_windows, n, n]; attn_windows: [b_, n, c]
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, c)
-        shifted_x = window_reverse(attn_windows, self.window_size, h, w)  # b h' w' c
+        # .view(): [b_, n, c] -> [b_, Wh, Ww, c]
+        shifted_x = window_reverse(attn_windows, self.window_size, h, w)
+        # -> [b, Ph, Pw, c]
         # reverse cyclic shift
         if self.shift_size > 0:
             attn_x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
@@ -482,6 +514,7 @@ class PFTransformerLayer(nn.Module):
         flops = 0
         h, w = self.input_resolution if input_resolution is None else input_resolution
 
+        # wqkv, n*c*3c
         flops += self.dim * 3 * self.dim * h * w
 
         # W-MSA/SW-MSA
@@ -489,7 +522,9 @@ class PFTransformerLayer(nn.Module):
         flops += nw * self.attn_win.flops(self.window_size * self.window_size)
 
         # mlp
+        # 2 linear layer: dim -> mlp_ratio*dim -> dim
         flops += 2 * h * w * self.dim * self.dim * self.mlp_ratio
+        # depthwide conv layer
         flops += h * w * self.dim * (self.convffn_kernel_size ** 2) * self.mlp_ratio
         # lepe
         flops += h * w * self.dim * (self.convlepe_kernel_size ** 2)
@@ -853,7 +888,9 @@ class UpsampleOneStep(nn.Sequential):
     def flops(self, input_resolution):
         flops = 0
         h, w = self.patches_resolution if input_resolution is None else input_resolution
+        # !!! h, w = input_resolution
         flops = h * w * self.num_feat * 3 * 9
+        # !!! flops = h * w* self.num_feat * (scale ** 2) * num_out_ch * 9
         return flops
 
 @ARCH_REGISTRY.register()
@@ -1064,16 +1101,27 @@ class PFT(nn.Module):
 
     def calculate_rpi_sa(self):
         # calculate relative position index for SW-MSA
+        # generate x-y coordinates for all tokens
         coords_h = torch.arange(self.window_size)
+        # [Wh], 0..Wh-1
         coords_w = torch.arange(self.window_size)
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-        relative_coords[:, :, 0] += self.window_size - 1  # shift to start from 0
+        # [Ww], 0..Ww-1
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+        # # [2, Wh, Ww]  coords[0] -> y (row), coords[1] -> x (col)
+        coords_flatten = torch.flatten(coords, 1)
+        # [2, n], n=Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        # calculate relative position between any two tokens
+        # broadcasting: [2, n, 1] - [2, 1, n] -> [2, n, n]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        # [n, n, 2]
+        relative_coords[:, :, 0] += self.window_size - 1
+        # shift to non-zero interval [0..(2*W-2)]; dy += Wh-1
         relative_coords[:, :, 1] += self.window_size - 1
+        # dx += Ww-1
         relative_coords[:, :, 0] *= 2 * self.window_size - 1
-        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        relative_position_index = relative_coords.sum(-1)
+        # map (dy, dx) to one-dimensional index; idx = dy * (2*Ww-1) + dx; [n, n]
         return relative_position_index
 
     def calculate_mask(self, x_size):
@@ -1091,21 +1139,27 @@ class PFT(nn.Module):
                 cnt += 1
 
         mask_windows = window_partition(img_mask, self.window_size)  # nw, window_size, window_size, 1
+        # [1, h, w, 1] -> [num_windows, Wh, Ww, 1]
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        # -> [num_windows, n]
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        # -> [num_windows, n, n]
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
         return attn_mask
 
     def forward(self, x):
+        # x: [B, C_in, H_ori, W_ori]
         h_ori, w_ori = x.size()[-2], x.size()[-1]
         mod = self.window_size
         h_pad = ((h_ori + mod - 1) // mod) * mod - h_ori
         w_pad = ((w_ori + mod - 1) // mod) * mod - w_ori
         h, w = h_ori + h_pad, w_ori + w_pad
+        # concatenate + flip -> reflect padding
         x = torch.cat([x, torch.flip(x, [2])], 2)[:, :, :h, :]
         x = torch.cat([x, torch.flip(x, [3])], 3)[:, :, :, :w]
 
+        # Normalization (subtract mean, scale range)
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
@@ -1135,8 +1189,10 @@ class PFT(nn.Module):
             # for image denoising and JPEG compression artifact reduction
             x_first = self.conv_first(x)
             res = self.conv_after_body(self.forward_features(x_first)) + x_first
+            # res = self.conv_after_body(self.forward_features(x_first, params)) + x_first
             x = x + self.conv_last(res)
 
+        # Denomalization
         x = x / self.img_range + self.mean
 
         # unpadding
@@ -1148,11 +1204,14 @@ class PFT(nn.Module):
         flops = 0
         resolution = self.patches_resolution if input_resolution is None else input_resolution
         h, w = resolution
+        # conv first
         flops += h * w * 3 * self.embed_dim * 9
         flops += self.patch_embed.flops(resolution)
         for layer in self.layers:
             flops += layer.flops(resolution)
+        # conv after body
         flops += h * w * 3 * self.embed_dim * self.embed_dim
+        # !!! flops += h * w * embed_dim * embed_dim * 9
         if self.upsampler == 'pixelshuffle':
             flops += self.upsample.flops(resolution)
         else:
